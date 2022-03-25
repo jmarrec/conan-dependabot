@@ -1,0 +1,18 @@
+[requires]
+zlib/1.2.11#683857dbd5377d65f26795d4023858f9
+openssl/1.1.1m
+# bzip2/1.0.6
+
+[build_requires]
+ruby_installer/2.5.3@bincrafters/stable
+
+[generators]
+gcc
+cmake
+txt
+
+[options]
+
+[imports]
+bin, *.dll -> ./bin # Copies all dll files from the package "bin" folder to my project "bin" folder
+lib, *.dylib* -> ./bin # Copies all dylib files from the package "lib" folder to my project "bin" folder

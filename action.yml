@@ -1,0 +1,383 @@
+name: 'Rubocop Composite Action'
+description: 'A github composite action (runs natively on the host) that will look for outdated conan packages'
+author: 'Julien Marrec'
+branding:
+  icon: 'alert-triangle'
+  color: 'red'
+inputs:
+  setup-python:
+    description: Whether you want to set up a Python env or not.
+    default: true
+  enable-conan-revision:
+    description: Whether you allow enabling conan revisions
+    default: true
+  open-pull-request:
+    description: if true it will a PR with the changes
+    default: true
+
+  conanfiles:
+    description: >
+      A comma or newline-separated list of file paths to check.
+      Paths should follow git's pathspec syntax.
+      Defaults to adding all conanfile.py conanfile.txt (and maybe CMake files).
+
+  include-cmake-files:
+    description: >
+      Search CMakeLists.txt and .cmake files for conan_cmake_ and add them to the check
+      Ignored if conanfiles is supplied
+    default: false
+
+  add-conan-remotes:
+    description: >
+      A comma or newline-separated list of remotes to add
+      Should follow the conan remote list --raw convention
+      eg 'conancenter https://center.conan.io True'
+
+  force-versions:
+    description: >
+      vblabldglkfgdjg
+
+outputs:
+  summary:
+    description: "High level info (number of files checked and number of offenses) from rubocop"
+    value: ${{ steps.analyze_rubocop.outputs.summary }}
+  all_output:
+    description: "High level info and all annotations from rubocop"
+    value: ${{ steps.analyze_rubocop.outputs.all_output }}
+  rubocop_was_installed:
+    description: "For testing purposes mostly, see if rubocop was installed by the action (true) or already installed (false)"
+    value: ${{ steps.check_rubocop_installed.outputs.rubocop_was_installed }}
+
+runs:
+  using: 'composite'
+  steps:
+    #- uses: actions/checkout@v2
+
+    - uses: actions/setup-python@v3
+      if: ${{ inputs.setup-python }}
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        pip install -r requirements.txt
+
+
+    - name: Enable conan revisions
+      if: ${{ inputs.enable-conan-revision }}
+      shell: bash
+      run: |
+        echo "Enabling conan revisions"
+        conan config set general.revisions_enabled=True
+
+
+    - name: Find outdated conan packages
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        # This returns 1 if update was needed
+        python dependabot_conan.py
+
+    - name: Commit results
+      if: ${{ inputs.open-pull-request && failure() }}
+      shell: bash
+      run: |
+        set -x
+        git config user.name 'Conan Dependabot'
+        git config user.email 'conan-dependabot@users.noreply.github.com'
+        git commit -am "Automated checkin - update conan recipes"
+
+    - name: Create Pull Request
+      uses: peter-evans/create-pull-request@v4
+      if: ${{ inputs.open-pull-request && failure() }}
+      with:
+        branch: dependabot/conan
+        committer: 'Conan Dependabot <conan-dependabot@users.noreply.github.com>'
+        delete-branch: true
+        title: "[bot] New upstream conan recipes"
+        body: |
+         Automatic run of `[dependabot_conan.py](developer/conan/dependabot_conan.py)`
+          which is done periodically to be made aware of upstream recipe updates
+
+
+    - name: Check if rubocop gem is installed
+      id: check_rubocop_installed
+      shell: bash
+      run: |
+        set -x
+        if [[ `gem list -i "^rubocop$"` != "true" ]]; then
+          echo "gem rubocop is not installed"
+          echo "::set-output name=rubocop_was_installed::true"
+          gem install rubocop -v '${{ inputs.rubocop-version }}'
+        else
+          echo "Rubocop is already installed:"
+          gem list "^rubocop$"
+          echo "::set-output name=rubocop_was_installed::false"
+        fi
+
+    # actions/runner#646: you cannot use `if` conditional either...
+    #- name: Install rubocop
+      #if: ${{ steps.check_rubocop_installed.rubocop_was_installed == 'true' }}
+      #shell: bash
+      #run: |
+        #set -x
+        #gem install rubocop -v '${{ inputs.rubocop-version }}'
+
+    - name: Install python requests and check versions
+      shell: bash
+      run: |
+        set -x
+        pip install requests
+        python --version
+        ruby --version
+        rubocop --version
+
+    - name: Rubocop ?
+      # if: ${{ inputs. }}"
+      shell: bash
+      run: |
+        if [[ "${{ inputs. }}" == "true" ]]; then
+          if [[ "${{ inputs.commit-auto-correct }}" == "true" ]]; then
+
+            branch_name=""
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              branch_name="${{ github.head_ref }}"
+              echo "Checking out branch: $branch_name"
+              git checkout -b $branch_name || git checkout $branch_name
+            fi
+
+            echo "Running rubocop "
+            rubocop --auto-correct || true
+
+            git add -u
+            if [[ $(git diff --cached --exit-code) ]]; then
+              git config --global user.email 'github-rubocop-actions[bot]@users.noreply.github.com'
+              git config --global user.name 'github-rubocop-actions[bot]'
+              git commit -m "Commit rubocop --auto-correct (Ruby $(ruby --version), Rubocop $(rubocop --version))"
+              if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                git push -u origin $branch_name
+              else
+                git push
+              fi
+            fi
+
+          else
+            echo "Running rubocop "
+            rubocop --auto-correct || true
+          fi
+        else
+          echo "Autocorrect skipped"
+        fi
+
+    # Because windows refuses to do subprocess.run(shlex.split('rubocop --format json') even if I supply the full path
+    # So I'm running this step in bash instead of inside the python later...
+    - name: run rubocop
+      shell: bash
+      run: |
+          rubocop --format json > rubocop.json || true
+
+    - name: Analyze rubocop results
+      id: analyze_rubocop
+      shell: python
+      run: |
+        import os
+        import json
+        import shlex
+        import subprocess
+        import datetime
+        import requests
+
+        if not 'GITHUB_TOKEN' in os.environ:
+            raise ValueError("You must pass env GITHUB_TOKEN set to secrets.GITHUB_TOKEN")
+
+        GITHUB_TOKEN = os.environ['GITHUB_TOKEN']
+        GITHUB_SHA = os.environ['GITHUB_SHA'] # TODO for PRs, perhaps github.head_ref is better
+        GITHUB_EVENT_NAME = os.environ['GITHUB_EVENT_NAME']
+        print(f"{GITHUB_EVENT_NAME=}, {GITHUB_SHA=}")
+        OWNER_REPO = "${{ github.repository }}"  # "owner/repo"
+
+        ANNOTATIONS_LEVELS = {
+          'refactor': 'failure',
+          'convention': 'failure',
+          'warning': 'warning',
+          'error': 'failure',
+          'fatal': 'failure'
+        }
+
+        CHECK_NAME = 'rubocop'
+
+        HEADERS = {
+          "Content-Type": 'application/json',
+          "Accept": 'application/vnd.github.antiope-preview+json',
+          "Authorization": "Bearer {}".format(GITHUB_TOKEN),
+          "User-Agent": 'github-actions-rubocop'
+        }
+
+        def run_rubocop():
+            """
+            Runs `rubocop --format json` parse json into a python dict
+            Also prints the summary data
+            """
+
+            # result = subprocess.run([r'${{ steps.check_rubocop_installed.outputs.rubocop_path }}', '--format', 'json'],
+            #                        capture_output=True)
+
+            #if result.returncode == 0:
+                #conclusion = 'success'
+            #else:
+                #conclusion = 'failure'
+
+            #data = json.loads(result.stdout)
+            #print("Rubocop exited with {}: {}".format(result.returncode, conclusion))
+
+            with open('rubocop.json', 'r') as f:
+                data = json.load(f)
+            os.remove('rubocop.json')
+
+            print(json.dumps(data['summary'], indent=4, sort_keys=True))
+            print(f"::set-output name=summary::'{json.dumps(data['summary'])}'")
+
+            return data
+
+
+        def process_rubocop_output(data):
+            """
+            Processes the output of `rubocop --format json` and create an output object
+            with annotations
+
+            Args:
+            -----
+            data (dict): the parsed output of rubocop json
+
+            Returns:
+            ---------
+            conclusion (str): 'failure' or 'success'
+            output (dict): the output object
+                see https://developer.github.com/v3/checks/runs/#output-object-1
+            """
+            annotations = []
+            conclusion = 'success'
+
+            for f in data['files']:
+                if not f['offenses']:
+                    continue
+                path = f['path']
+                for offense in f['offenses']:
+                    severity = offense['severity']
+                    correctable = " (Correctable)" if offense['correctable'] else ""
+                    message = "{}: {}{}".format(offense['cop_name'],
+                                                offense['message'],
+                                                correctable)
+                    location = offense['location']
+                    annotation_level = ANNOTATIONS_LEVELS[severity]
+
+                    if annotation_level == 'failure':
+                        conclusion = 'failure'
+
+                    annotations.append({
+                        'path': path,
+                        'start_line': location['start_line'],
+                        'end_line': location['last_line'],
+                        'annotation_level': annotation_level,
+                        'message': message
+                    })
+
+            title = "{} {} (ruby {}p{})".format(CHECK_NAME,
+                                                data['metadata']['rubocop_version'],
+                                                data['metadata']['ruby_version'],
+                                                data['metadata']['ruby_patchlevel'])
+            output = {
+                "title": title,
+                "summary": "{} offense(s) found".format(
+                    data['summary']['offense_count']),
+                'annotations': annotations
+            }
+
+            print(f"::set-output name=all_output::'{json.dumps(output)}'")
+            return conclusion, output
+
+
+        def create_check_run():
+            """
+            Creates the initial check-run with a status of 'in_progress' and returns
+            the id of the check-run that was created. Throws if failed
+            """
+
+            body = {
+              'name': CHECK_NAME,
+              'head_sha': GITHUB_SHA,
+              'status': 'in_progress',
+              'started_at': datetime.datetime.utcnow().isoformat() + 'Z'
+            }
+
+            query_url = "https://api.github.com/repos/{}/check-runs".format(OWNER_REPO)
+
+            r = requests.post(query_url, headers=HEADERS, data=json.dumps(body))
+            if r.status_code != requests.codes.created:
+                # r.raise_for_status()
+                http_error_msg = ("{} Error: {} for url: "
+                                  "{}.\n{}".format(r.status_code, r.reason, r.url, json.dumps(r.json(), indent=4, sort_keys=True)))
+                raise requests.exceptions.HTTPError(http_error_msg, response=r)
+            data = r.json()
+            print(f"create_check_run response: {json.dumps(data, indent=4, sort_keys=True)}")
+            return data['id'], data['url']
+
+
+        def update_check_run(check_url, conclusion, output):
+            """
+            Update the given check-run (check_url) with the conclusion and annotations
+            and sets its status to 'completed'. Uses a PATCH not a POST
+
+            Args:
+            ------
+            check_url (url): the url of the check_run, returned from create_check_run
+
+            conclusion (str): one of ['success', 'failure', 'neutral', 'cancelled',
+            'skipped', 'timed_out', 'action_required']
+
+            output (json object):
+                see https://developer.github.com/v3/checks/runs/#output-object-1
+
+            """
+
+            body = {
+                'name': CHECK_NAME,
+                'head_sha': GITHUB_SHA,
+                'status': 'completed',
+                'completed_at': datetime.datetime.utcnow().isoformat() + 'Z',
+                'conclusion': conclusion,
+                'output': output
+            }
+
+            # query_url = (
+            #     "https://api.github.com/repos/{}/check-runs/{}".format(OWNER_REPO,
+            #                                                            check_id))
+
+            r = requests.patch(check_url, data=json.dumps(body), headers=HEADERS)
+            if r.status_code != requests.codes.ok:
+                # r.raise_for_status()
+                http_error_msg = ("{} Error: {} for url: "
+                                  "{}.\n{}".format(r.status_code, r.reason, r.url, json.dumps(r.json(), indent=4, sort_keys=True)))
+                raise requests.exceptions.HTTPError(http_error_msg, response=r)
+
+
+        if __name__ == '__main__':
+            check_id, check_url = create_check_run()
+            print(f"Check run created with id {check_id}: {check_url}")
+            output = {}
+            try:
+                data = run_rubocop()
+                conclusion, output = process_rubocop_output(data)
+                print(f"{conclusion=}")
+                print(f"{json.dumps(output, indent=4, sort_keys=True)}")
+                update_check_run(check_url, conclusion, output)
+                print("update_check_run done")
+            except Exception as e:
+                update_check_run(check_url, "failure", None)
+                raise e
+
+            print("Reached up this point")
+            if conclusion == "failure" and ('TEST_DONOT_THROW' not in os.environ):
+                raise RuntimeError(f"Rubocop found failures:\n{json.dumps(output, indent=4, sort_keys=True)}")
